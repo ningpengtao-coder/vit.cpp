@@ -1,5 +1,5 @@
 #include "vit.h"
-#include "ggml/ggml.h"
+#include "ggml.h"
 
 #include <nlohmann/json.hpp>
 

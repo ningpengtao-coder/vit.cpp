@@ -1,8 +1,9 @@
 #pragma once
 
-#include "ggml/ggml.h"
-#include "ggml/ggml-alloc.h"
-#include "ggml/examples/stb_image.h"
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "stb_image.h"
 
 #include <cassert>
 #include <cmath>
@@ -74,9 +75,8 @@ struct vit_state
     struct ggml_tensor *prediction;
     struct ggml_context *ctx;
     std::vector<uint8_t> work_buffer;
-    std::vector<uint8_t> buf_alloc_img_enc;
     std::vector<uint8_t> buf_compute_img_enc;
-    struct ggml_allocr *allocr;
+    ggml_gallocr_t gallocr = nullptr; /* 图分配器，CPU 缓冲类型，跨推理复用 */
 };
 
 struct vit_model
@@ -118,7 +118,10 @@ void ggml_graph_compute_helper(std::vector<uint8_t> &buf, ggml_cgraph *graph, in
 bool load_image_from_file(const std::string &fname, image_u8 &img);
 bool vit_image_preprocess(const image_u8 &img, image_f32 &res, const vit_hparams &params);
 bool vit_model_load(const std::string &fname, vit_model &model);
-struct ggml_cgraph *vit_encode_image(const vit_model &model, vit_state &state, const image_f32 &img);
+struct ggml_cgraph *vit_encode_image(const vit_model &model, vit_state &state, const image_f32 &img, bool apply_softmax = true,
+                                     struct ggml_tensor **out_inp = nullptr);
+/* 把 HWC 图像写入已由 gallocr 分配好的输入张量。 */
+void vit_set_input(struct ggml_tensor *inp, const image_f32 &img);
 int vit_predict(const vit_model &model, vit_state &state, const image_f32 img1, const vit_params &params, std::vector<std::pair<float, int>> &predictions);
 void print_usage(int argc, char **argv, const vit_params &params);
 bool vit_params_parse(int argc, char **argv, vit_params &params);

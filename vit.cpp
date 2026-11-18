@@ -1,11 +1,13 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables ridiculous "unsafe" warnigns on Windows
 
 #include "vit.h"
-#include "ggml/ggml.h"
-#include "ggml/ggml-alloc.h"
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #define STB_IMAGE_IMPLEMENTATION
-#include "ggml/examples/stb_image.h" // stb image load
+#include "stb_image.h" // stb image load
 
 #include <cassert>
 #include <cmath>
@@ -24,6 +26,12 @@
 #if defined(_MSC_VER)
 #pragma warning(disable : 4244 4267) // possible loss of data
 #endif
+
+// ggml no longer exposes ggml_type_sizef() in its public header
+static float ggml_type_sizef(enum ggml_type type)
+{
+    return (float) ggml_type_size(type) / ggml_blck_size(type);
+}
 
 // default ViT-B hparams
 // vit_base_patch8_224.augreg2_in21k_ft_in1k from timm
@@ -94,7 +102,7 @@ static void ggml_disconnect_node_from_graph(ggml_tensor *t)
 
 void ggml_graph_compute_helper(std::vector<uint8_t> &buf, ggml_cgraph *graph, int n_threads)
 {
-    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads, nullptr);
 
     if (plan.work_size > 0)
     {
@@ -718,7 +726,9 @@ bool vit_model_load(const std::string &fname, vit_model &model)
 struct ggml_cgraph *vit_encode_image(
     const vit_model &model,
     vit_state &state,
-    const image_f32 &img)
+    const image_f32 &img,
+    bool apply_softmax,
+    struct ggml_tensor **out_inp)
 {
 
     const auto &hparams = model.hparams;
@@ -745,27 +755,9 @@ struct ggml_cgraph *vit_encode_image(
     struct ggml_cgraph *gf = ggml_new_graph(ctx0);
 
     struct ggml_tensor *inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_img_size, n_img_size, 3, 1);
-    ggml_allocr_alloc(state.allocr, inp);
-    if (!ggml_allocr_is_measure(state.allocr))
+    if (out_inp != nullptr)
     {
-        float *data = (float *)ggml_get_data(inp);
-
-        const int nx = img.nx;
-        const int ny = img.ny;
-        const int n = nx * ny;
-
-        GGML_ASSERT(nx == n_img_size && ny == n_img_size);
-
-        for (int k = 0; k < 3; k++)
-        {
-            for (int y = 0; y < ny; y++)
-            {
-                for (int x = 0; x < nx; x++)
-                {
-                    data[k * n + y * nx + x] = img.data[3 * (y * nx + x) + k];
-                }
-            }
-        }
+        *out_inp = inp;
     }
 
     // patch embedding
@@ -791,7 +783,7 @@ struct ggml_cgraph *vit_encode_image(
     cur = ggml_reshape_4d(ctx0, cur, hidden_size, n_img_embd * n_img_embd, 1, 1);
 
     // concat class embeddings(cls_token) : (768  1  1  1) with positional embeddings (pos_embed = cur) : (768  784  1  1)
-    cur = ggml_permute(ctx0, ggml_concat(ctx0, enc.cls_token, ggml_permute(ctx0, cur, 0, 2, 1, 3)),
+    cur = ggml_permute(ctx0, ggml_concat(ctx0, enc.cls_token, ggml_permute(ctx0, cur, 0, 2, 1, 3), 2),
                        0, 2, 1, 3); // 768  785  1  1
 
     cur = ggml_add_inplace(ctx0, cur, enc.pe);
@@ -851,7 +843,7 @@ struct ggml_cgraph *vit_encode_image(
             struct ggml_tensor *KQ_scaled =
                 ggml_scale_inplace(ctx0,
                                    KQ,
-                                   ggml_new_f32(ctx0, 1.0f / sqrtf(n_enc_head_dim)));
+                                   1.0f / sqrtf(n_enc_head_dim));
 
             struct ggml_tensor *KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_scaled);
 
@@ -906,9 +898,10 @@ struct ggml_cgraph *vit_encode_image(
     // pooling
     //
 
-    // get the output of cls token at index 0
-    struct ggml_tensor *cls = ggml_new_i32(ctx0, 0);
-    cur = ggml_get_rows(ctx0, cur, cls);
+    // 取 cls token（dim1 索引 0）：用 view + cont 代替旧版 ggml_get_rows + ggml_new_i32，
+    // 新版 ggml 的 ggml_new_i32 需要可分配上下文，不能用在 no_alloc 建图上下文里。
+    struct ggml_tensor *cls = ggml_view_3d(ctx0, cur, hidden_size, 1, 1, cur->nb[1], cur->nb[2], 0);
+    cur = ggml_cont(ctx0, cls);
 
     // layer normalization
     {
@@ -927,8 +920,8 @@ struct ggml_cgraph *vit_encode_image(
     cur = ggml_mul_mat(ctx0, classifier.head_w, cur);
     cur = ggml_add_inplace(ctx0, cur, classifier.head_b);
 
-    // softmax
-    ggml_tensor *probs = ggml_soft_max(ctx0, cur);
+    // softmax（C ABI 需要原始 logits 时可跳过）
+    ggml_tensor *probs = apply_softmax ? ggml_soft_max(ctx0, cur) : cur;
 
     probs = ggml_cpy(ctx0, probs, state.prediction);
 
@@ -1001,38 +994,61 @@ bool vit_params_parse(int argc, char **argv, vit_params &params)
     return true;
 }
 
+/* 把 HWC 图像写入已由 gallocr 分配好的输入张量。 */
+void vit_set_input(struct ggml_tensor *inp, const image_f32 &img)
+{
+    float *data = (float *)ggml_get_data(inp);
+
+    const int nx = img.nx;
+    const int ny = img.ny;
+    const int n = nx * ny;
+
+    assert(nx == inp->ne[0] && ny == inp->ne[1]);
+
+    for (int k = 0; k < 3; k++)
+    {
+        for (int y = 0; y < ny; y++)
+        {
+            for (int x = 0; x < nx; x++)
+            {
+                data[k * n + y * nx + x] = img.data[3 * (y * nx + x) + k];
+            }
+        }
+    }
+}
+
 int vit_predict(const vit_model &model, vit_state &state, const image_f32 img1, const vit_params &params, std::vector<std::pair<float, int>> &predictions)
 {
-    static const size_t tensor_alignment = 32;
-
-    // first build the graph and record memory requirements
-    state.buf_compute_img_enc.resize(ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead());
-    state.allocr = ggml_allocr_new_measure(tensor_alignment);
-    struct ggml_cgraph *gf_measure = vit_encode_image(model, state, img1);
-    if (!gf_measure)
+    // 图分配器按 CPU 缓冲类型创建，跨多次推理复用；alloc_graph 会自动扩容。
+    if (state.gallocr == nullptr)
     {
-        fprintf(stderr, "%s: failed to encode image\n", __func__);
-        return 1;
+        state.gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        if (state.gallocr == nullptr)
+        {
+            fprintf(stderr, "%s: failed to create graph allocator\n", __func__);
+            return 1;
+        }
     }
 
-    size_t alloc_size = ggml_allocr_alloc_graph(state.allocr, gf_measure) + tensor_alignment;
-    ggml_allocr_free(state.allocr);
+    // 元数据（张量描述/图结构）仍放在预分配的 no_alloc 上下文里。
+    state.buf_compute_img_enc.resize(ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead());
 
-    // recreate allocator with exact memory requirements
-    state.buf_alloc_img_enc.resize(alloc_size);
-    state.allocr = ggml_allocr_new(state.buf_alloc_img_enc.data(), state.buf_alloc_img_enc.size(), tensor_alignment);
-
-    // compute the graph with the measured exact memory requirements from above
-    ggml_allocr_reset(state.allocr);
-
-    struct ggml_cgraph *gf = vit_encode_image(model, state, img1);
+    struct ggml_tensor *inp = nullptr;
+    struct ggml_cgraph *gf = vit_encode_image(model, state, img1, true, &inp);
     if (!gf)
     {
         fprintf(stderr, "%s: failed to encode image\n", __func__);
         return 1;
     }
 
-    ggml_allocr_alloc_graph(state.allocr, gf);
+    if (!ggml_gallocr_alloc_graph(state.gallocr, gf))
+    {
+        fprintf(stderr, "%s: failed to allocate graph\n", __func__);
+        return 1;
+    }
+
+    vit_set_input(inp, img1);
+
     ggml_graph_compute_helper(state.work_buffer, gf, params.n_threads);
 
     // print_t_f32("after probs", state.prediction);
@@ -1066,9 +1082,7 @@ int vit_predict(const vit_model &model, vit_state &state, const image_f32 img1, 
                predictions[i].first);
     }
 
-    // free memory
-    ggml_allocr_free(state.allocr);
-    state.allocr = NULL;
+    // 释放本次的 CPU 计算工作区；gallocr 与其缓冲保留供后续推理复用。
     state.work_buffer.clear();
 
     return 0;

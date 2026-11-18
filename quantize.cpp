@@ -1,8 +1,8 @@
 // add simple qunatization strategies
 // adapted from : ggml/gpt-2
 
-#include "ggml/ggml.h"
-#include "ggml/ggml-alloc.h"
+#include "ggml.h"
+#include "ggml-alloc.h"
 
 #include <cassert>
 #include <cmath>
@@ -163,8 +163,6 @@ bool vit_model_quantize(const std::string &fname_inp, const std::string &fname_o
         std::vector<ggml_fp16_t> data_f16;
         std::vector<float> data_f32;
 
-        std::vector<int64_t> hist_all(1 << 4, 0);
-
         while (true)
         {
             int32_t n_dims;
@@ -266,56 +264,21 @@ bool vit_model_quantize(const std::string &fname_inp, const std::string &fname_o
                 work.resize(nelements); // for quantization
 
                 size_t cur_size = 0;
-                std::vector<int64_t> hist_cur(1 << 4, 0);
 
-                switch (type)
-                {
-                case GGML_TYPE_Q4_0:
-                {
-                    cur_size = ggml_quantize_q4_0(data_f32.data(), work.data(), nelements, ne[0], hist_cur.data());
-                }
-                break;
-                case GGML_TYPE_Q4_1:
-                {
-                    cur_size = ggml_quantize_q4_1(data_f32.data(), work.data(), nelements, ne[0], hist_cur.data());
-                }
-                break;
-                case GGML_TYPE_Q5_0:
-                {
-                    cur_size = ggml_quantize_q5_0(data_f32.data(), work.data(), nelements, ne[0], hist_cur.data());
-                }
-                break;
-                case GGML_TYPE_Q5_1:
-                {
-                    cur_size = ggml_quantize_q5_1(data_f32.data(), work.data(), nelements, ne[0], hist_cur.data());
-                }
-                break;
-                case GGML_TYPE_Q8_0:
-                {
-                    cur_size = ggml_quantize_q8_0(data_f32.data(), work.data(), nelements, ne[0], hist_cur.data());
-                }
-                break;
-                default:
+                if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q5_0 &&
+                    type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0)
                 {
                     fprintf(stderr, "%s: unsupported quantization type %d\n", __func__, type);
                     return false;
                 }
-                }
+
+                // ggml_quantize_chunk 是新版 ggml 的统一入口（旧的 ggml_quantize_qX_Y 已移除）。
+                cur_size = ggml_quantize_chunk(type, data_f32.data(), work.data(), 0, nelements / ne[0], ne[0], nullptr);
 
                 fout.write(reinterpret_cast<char *>(work.data()), cur_size);
                 total_size_new += cur_size;
 
-                printf("size = %8.2f MB -> %8.2f MB | hist: ", nelements * sizeof(float) / 1024.0 / 1024.0, cur_size / 1024.0 / 1024.0);
-                for (int i = 0; i < hist_cur.size(); ++i)
-                {
-                    hist_all[i] += hist_cur[i];
-                }
-
-                for (int i = 0; i < hist_cur.size(); ++i)
-                {
-                    printf("%5.3f ", hist_cur[i] / (float)nelements);
-                }
-                printf("\n");
+                printf("size = %8.2f MB -> %8.2f MB\n", nelements * sizeof(float) / 1024.0 / 1024.0, cur_size / 1024.0 / 1024.0);
             }
             else
             {
@@ -329,21 +292,6 @@ bool vit_model_quantize(const std::string &fname_inp, const std::string &fname_o
 
         printf("%s: model size  = %8.2f MB\n", __func__, total_size_org / 1024.0 / 1024.0);
         printf("%s: quant size  = %8.2f MB\n", __func__, total_size_new / 1024.0 / 1024.0);
-
-        {
-            int64_t sum_all = 0;
-            for (int i = 0; i < hist_all.size(); ++i)
-            {
-                sum_all += hist_all[i];
-            }
-
-            printf("%s: hist: ", __func__);
-            for (int i = 0; i < hist_all.size(); ++i)
-            {
-                printf("%5.3f ", hist_all[i] / (float)sum_all);
-            }
-            printf("\n");
-        }
     }
 
     finp.close();

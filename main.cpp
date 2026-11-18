@@ -1,9 +1,9 @@
 #define _CRT_SECURE_NO_DEPRECATE // disables "unsafe" warnings on Windows
 
 #include "vit.h"
-#include "ggml/ggml.h"
-#include "ggml/ggml-alloc.h"
-#include "ggml/examples/stb_image.h" // stb image load
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "stb_image.h" // stb image load
 
 #include <cassert>
 #include <cmath>
@@ -25,6 +25,10 @@
 // main function
 int main(int argc, char **argv)
 {
+    // Windows 上 ggml_time_us() 依赖 ggml_time_init() 初始化计时频率，
+    // 否则首次调用会因除零崩溃。
+    ggml_time_init();
+
     const int64_t t_main_start_us = ggml_time_us();
 
     vit_params params;
